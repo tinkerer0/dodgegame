@@ -118,4 +118,4 @@ Python 3 표준 라이브러리만 사용한다. 유일하게 눈에 띄는 impo
 
 ## 라이선스
 
-MIT © AItinkerer0
+MIT © tinkerer0
