@@ -1,5 +1,9 @@
 # dodgegame
 
+[포트폴리오](https://github.com/tinkerer0/tinkerer0) · [게임 목록](https://github.com/tinkerer0/tinkerer0/blob/main/docs/GAMES.md)
+
+**분류:** 터미널 게임 · **상태:** 공개 프로토타입
+
 터미널에서 돌아가는 **턴제 닷지(turn-based dodge)** 생존 게임이다. 한 키 입력 = 한 턴 — 실시간 압박 없이 한 수씩 두면서, 사방 가장자리에서 스폰돼 직선으로 날아오는 장애물을 피해 얼마나 오래 버티는지 겨루는 회피 퍼즐이다.
 
 ## 조작법
