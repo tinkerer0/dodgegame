@@ -15,6 +15,7 @@ import sys
 import time
 import random
 import signal
+import math
 from typing import NamedTuple
 
 # curses는 표준 라이브러리이지만 --help/--selftest 경로에서는 굳이 화면을
@@ -47,18 +48,27 @@ ACTIONS = {
 # 스폰 램프 튜닝 상수
 # ============================================================
 
-# 난이도 실측(scratchpad measure_difficulty.py, 12x12 보드·랜덤 액션 30~60시드
-# 평균): 이전 상수(base0.12/ramp0.01/max0.6/rampevery20/cap4) 평균 생존
-# 38.50턴 -> 아래 상수 평균 생존 25.03턴(baseline의 65.0%, 목표 60~70% 안).
-# 랜덤 플레이 지표라 사람 체감은 훨씬 관대하다(텔레그래프를 읽고 피하므로) —
-# 상대 변화율만 참고할 것.
-SPAWN_CHANCE_BASE = 0.30            # 턴 0에서의 스폰(웨이브) 시도 확률
-SPAWN_CHANCE_RAMP_PER_TURN = 0.025  # 턴마다 스폰 확률 증가량
-SPAWN_CHANCE_MAX = 0.8              # 스폰 확률 상한(화면이 순식간에 안 막히게)
-SPAWN_COUNT_MAX_BASE = 1            # 초반 한 웨이브당 최대 스폰 개수
-SPAWN_COUNT_RAMP_EVERY_TURNS = 10   # 이 턴마다 한 웨이브 최대 개수 +1
-SPAWN_COUNT_MAX_CAP = 5             # 한 웨이브 최대 개수 상한(회피 불가 방지)
+# 생성 확률은 90%에 천천히 가까워지고, 웨이브당 평균 개수는 로그 곡선으로
+# 계속 증가한다. 초반 급상승과 40턴 이후의 고정을 함께 없앤다.
+SPAWN_CHANCE_BASE = 0.30
+SPAWN_CHANCE_LIMIT = 0.90
+SPAWN_CHANCE_HALF_TURNS = 80.0      # 시작 확률과 한계 확률의 중간에 도달하는 턴
+SPAWN_COUNT_GROWTH_TURNS = 40.0     # 평균 개수 2/3/4/5개: 40/120/280/600턴
 SPAWN_MAX_ATTEMPTS = 8              # 즉사 회피 재시도 횟수(초과하면 이번 스폰만 포기)
+
+
+def spawn_parameters(turn):
+    """해당 턴의 웨이브 생성 확률과 웨이브당 평균 시도 개수를 돌려준다.
+
+    개수는 정수로 잘라 단계화하지 않고 _spawn_wave에서 확률적으로 반올림한다.
+    평균 2.2개이면 2개를 기본으로, 20% 확률로 1개를 더 시도한다.
+    """
+    progress = max(0, turn)
+    chance = SPAWN_CHANCE_BASE + (SPAWN_CHANCE_LIMIT - SPAWN_CHANCE_BASE) * (
+        progress / (progress + SPAWN_CHANCE_HALF_TURNS)
+    )
+    mean_count = 1.0 + math.log2(1.0 + progress / SPAWN_COUNT_GROWTH_TURNS)
+    return chance, mean_count
 
 
 class Obstacle:
@@ -160,14 +170,12 @@ class DodgeSim:
     # --- 스폰 램프 ---
 
     def _spawn_wave(self):
-        chance = min(SPAWN_CHANCE_BASE + self.turn * SPAWN_CHANCE_RAMP_PER_TURN, SPAWN_CHANCE_MAX)
+        chance, mean_count = spawn_parameters(self.turn)
         if self.rng.random() >= chance:
             return
-        max_count = min(
-            SPAWN_COUNT_MAX_BASE + self.turn // SPAWN_COUNT_RAMP_EVERY_TURNS,
-            SPAWN_COUNT_MAX_CAP,
-        )
-        count = self.rng.randint(1, max(1, max_count))
+        count = int(mean_count)
+        if self.rng.random() < mean_count - count:
+            count += 1
         for _ in range(count):
             obs = self._make_spawn_candidate()
             if obs is not None:
@@ -1395,6 +1403,70 @@ def run_selftest():
         ok = False
         results.append(f"FAIL: _active_row_index - {e}")
 
+    # 난이도는 장기에도 증가하며 한 턴 경계에서 크게 뛰지 않는다.
+    try:
+        previous_chance, previous_count = spawn_parameters(0)
+        for turn in range(1, 10001):
+            chance, mean_count = spawn_parameters(turn)
+            assert 0 < chance - previous_chance < 0.01, f"생성 확률 급변/정체: {turn}턴"
+            assert 0 < mean_count - previous_count < 0.04, f"생성 개수 급변/정체: {turn}턴"
+            previous_chance, previous_count = chance, mean_count
+        chance, mean_count = spawn_parameters(10**9)
+        assert 0 < chance < 1 and math.isfinite(mean_count), "장기 난이도 값이 유효하지 않음"
+        assert mean_count > previous_count, "장기 생성 개수가 증가하지 않음"
+        results.append("PASS: 난이도 연속 증가·턴 경계 완만함·장기 유효성")
+    except AssertionError as e:
+        ok = False
+        results.append(f"FAIL: 난이도 곡선 - {e}")
+
+    # 실제 step 경로에서 정수 경계 양쪽의 추가 1개 확률과 미생성을 확인한다.
+    try:
+        class WaveRng:
+            def __init__(self, *rolls):
+                self.rolls = iter(rolls)
+
+            def random(self):
+                return next(self.rolls)
+
+        for turn, low, high in ((39, 1, 2), (40, 2, 2), (41, 2, 3), (1000, 5, 6)):
+            for roll, expected in ((0.0, high), (0.999999, low)):
+                sim = DodgeSim(20, 20, rng=WaveRng(0.0, roll))
+                sim.turn = turn - 1
+                sim._make_spawn_candidate = lambda: Obstacle(0, 0, 1, 0)
+                sim.step("right")
+                assert len(sim.obstacles) == expected, f"{turn}턴 확률 반올림 실패"
+                assert sim.turn == turn and not sim.game_over, "턴 진행 실패"
+        sim = DodgeSim(20, 20, rng=WaveRng(0.999999))
+        sim.turn = 999
+        sim.step("right")
+        assert not sim.obstacles, "생성하지 않는 확률이 사라짐"
+        sim.reset()
+        assert spawn_parameters(sim.turn) == spawn_parameters(0), "재시작 난이도 복원 실패"
+        results.append("PASS: step의 확률 반올림·미생성·재시작 난이도 복원")
+    except (AssertionError, StopIteration) as e:
+        ok = False
+        results.append(f"FAIL: 난이도 적용 - {e}")
+
+    # 생성 위치 재시도까지 포함한 실제 평균량이 후반에도 늘어나는지 확인한다.
+    try:
+        averages = []
+        for turn in (40, 100, 300, 1000):
+            sim = DodgeSim(80, 24, rng=random.Random(20260917))
+            sim.turn = turn
+            total = 0
+            for _ in range(3000):
+                sim.obstacles = []
+                sim._spawn_wave()
+                total += len(sim.obstacles)
+            averages.append(total / 3000)
+        assert all(a < b for a, b in zip(averages, averages[1:])), f"후반 생성량 정체: {averages}"
+        assert 0.8 < averages[0] < 1.2, f"40턴 생성량 이탈: {averages[0]}"
+        assert 4.5 < averages[-1] < 5.3, f"1000턴 생성량 이탈: {averages[-1]}"
+        results.append("PASS: 실제 생성량 40/100/300/1000턴 증가")
+    except AssertionError as e:
+        ok = False
+        results.append(f"FAIL: 실제 생성량 - {e}")
+
     for line in results:
         print(line)
 
@@ -1443,8 +1515,8 @@ Rules:
   leave the grid. Each obstacle's next position is shown one turn ahead
   as a dim `·` (the telegraph). Game over when an obstacle enters your
   cell (including swapping places with you in one move). Score = turns
-  survived. Spawns get more frequent the longer you survive (slightly
-  harder than the previous version). There are 10 themes, and separate
+  survived. Spawn frequency and average wave size rise gradually as you
+  survive, including beyond turn 40. There are 10 themes, and separate
   glyph choices for You and the Enemy in the `/` menu, but none of it is
   saved -- next time you run the game it starts back at the defaults. If
   the menu list is taller than your terminal, it scrolls to keep your
